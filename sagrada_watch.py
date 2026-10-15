@@ -7,7 +7,7 @@ aufs Handy (über die kostenlose App "ntfy"), sobald ein passender Zeitslot frei
 Einrichtung (einmalig):
   pip install playwright requests
   playwright install chromium
-  Handy: App "ntfy" installieren, "+" tippen, den Topic-Namen aus NTFY_TOPIC abonnieren
+  Benachrichtigung: Telegram-Bot (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID) oder ntfy (NTFY_TOPIC)
 
 Start:
   python sagrada_watch.py           normaler Betrieb (läuft bis zum letzten Wunschtermin)
@@ -17,6 +17,7 @@ Start:
 
 import argparse
 import json
+import os
 import random
 import re
 import sys
@@ -31,7 +32,11 @@ from playwright.sync_api import sync_playwright
 URL = "https://tickets.sagradafamilia.org/en/1-individual/4375-sagrada-familia"
 
 NTFY_SERVER = "https://ntfy.sh"
-NTFY_TOPIC = "sagrada-mikey-lisa-k93jf2"   # eigenen, schwer erratbaren Namen wählen!
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or "sagrada-BITTE-AENDERN-7x3k9q"   # eigenen, schwer erratbaren Namen wählen!
+
+# Telegram (empfohlen, zuverlässiger als ntfy). Wenn beides gesetzt ist, wird Telegram genutzt.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")                    # vom @BotFather, als GitHub-Secret
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or "8965207955"     # Mikeys Chat-ID
 
 INTERVAL_MIN = 5          # Minuten zwischen zwei Prüfungen
 YEAR = 2026
@@ -42,6 +47,11 @@ for d in range(19, 24):
     TARGETS[date(YEAR, 10, d)] = "15:00"      # hier ggf. "16:00" oder früher eintragen
 for d in range(24, 31):
     TARGETS[date(YEAR, 10, d)] = None
+
+# TEST: hier sind noch Slots frei, damit lässt sich prüfen, ob der Bot funktioniert.
+# Nach erfolgreichem Test diese beiden Zeilen löschen.
+TEST_DATES = {date(YEAR, 11, 9)}
+TARGETS.update({d: None for d in TEST_DATES})
 
 BASE = Path(__file__).resolve().parent
 STATE_FILE = BASE / "sagrada_state.json"
@@ -57,12 +67,22 @@ def log(msg):
 
 
 def notify(title, message, priority=4, tags=("church",)):
-    """Push-Nachricht über ntfy (JSON-Variante, damit Umlaute sicher ankommen)."""
+    """Push-Nachricht über Telegram (falls eingerichtet), sonst über ntfy."""
     try:
-        requests.post(NTFY_SERVER, json={
-            "topic": NTFY_TOPIC, "title": title, "message": message,
-            "priority": priority, "tags": list(tags), "click": URL,
-        }, timeout=15)
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": f"{title}\n\n{message}\n\n{URL}",
+                "disable_notification": priority <= 2,   # Info-Nachrichten lautlos, Ticket-Alarm mit Ton
+                "disable_web_page_preview": True,
+            }, timeout=15)
+            if not r.ok:
+                log(f"Telegram-Fehler: {r.text}")
+        else:
+            requests.post(NTFY_SERVER, json={
+                "topic": NTFY_TOPIC, "title": title, "message": message,
+                "priority": priority, "tags": list(tags), "click": URL,
+            }, timeout=15)
     except Exception as e:
         log(f"Push fehlgeschlagen: {e}")
 
@@ -141,22 +161,33 @@ JS_SLOTS = r"""
 """
 
 
-def ensure_october(page):
-    for _ in range(3):
-        if re.search(r"october|octubre|octubre|oktober", page.inner_text("body"), re.I):
-            return
+MONTH_NAMES = {
+    10: r"october|octubre|oktober",
+    11: r"november|noviembre|novembre",
+    12: r"december|diciembre|desembre|dezember",
+}
+
+
+def goto_month(page, month):
+    """Blättert im Kalender vorwärts, bis der gewünschte Monat angezeigt wird."""
+    for _ in range(4):
+        if re.search(MONTH_NAMES[month], page.inner_text("body"), re.I):
+            return True
         nxt = page.get_by_role("button", name=re.compile(r"next|siguiente|seg[üu]ent|weiter", re.I))
         if not nxt.count():
-            return
+            nxt = page.locator("[class*=next], [aria-label*=next i]")
+        if not nxt.count():
+            return False
         nxt.first.click()
         page.wait_for_timeout(1500)
+    return bool(re.search(MONTH_NAMES[month], page.inner_text("body"), re.I))
 
 
-def open_page(page):
+def open_page(page, month):
     page.goto(URL, wait_until="networkidle", timeout=60000)
     page.wait_for_timeout(2000)
     dismiss_cookies(page)
-    ensure_october(page)
+    return goto_month(page, month)
 
 
 def check_once(debug=False):
@@ -185,17 +216,20 @@ def check_once(debug=False):
                         pass
             page.on("response", on_response)
 
-        open_page(page)
-        if debug:
-            page.screenshot(path=str(DEBUG_DIR / "00_start.png"), full_page=True)
-
+        current_month = None
         found_any = False
         for d, earliest in sorted(TARGETS.items()):
             if d < today:
                 continue
+            if d.month != current_month:              # neuer Monat: Seite frisch laden und hinblättern
+                current_month = d.month
+                if not open_page(page, d.month):
+                    notes.append(f"{d:%m.%Y}: Monat im Kalender nicht gefunden")
+                if debug:
+                    page.screenshot(path=str(DEBUG_DIR / f"00_monat_{d.month}.png"), full_page=True)
             info = page.evaluate(JS_FIND_DAY, d.day)
             if not info.get("found"):
-                open_page(page)                       # evtl. hat ein Klick die Ansicht gewechselt
+                open_page(page, d.month)              # evtl. hat ein Klick die Ansicht gewechselt
                 info = page.evaluate(JS_FIND_DAY, d.day)
             if not info.get("found"):
                 notes.append(f"{d:%d.%m.}: Tag im Kalender nicht gefunden")
@@ -232,16 +266,20 @@ def main():
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
-    if "BITTE-AENDERN" in NTFY_TOPIC:
-        sys.exit("Bitte zuerst NTFY_TOPIC im Skript auf einen eigenen Namen setzen.")
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) and "BITTE-AENDERN" in NTFY_TOPIC:
+        sys.exit("Bitte zuerst Telegram (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID) oder NTFY_TOPIC einrichten.")
 
     last_free = load_state()
     errors = 0
-    notify("Sagrada-Wächter gestartet",
-           f"Beobachte {len(TARGETS)} Tage, Prüfung alle {INTERVAL_MIN} Min.", priority=2, tags=("robot",))
+    if not args.once:
+        notify("Sagrada-Wächter gestartet",
+               f"Beobachte {len(TARGETS)} Tage, Prüfung alle {INTERVAL_MIN} Min.", priority=2, tags=("robot",))
 
     while True:
         if date.today() > max(TARGETS):
+            if args.once:                     # auf GitHub: still beenden, kein Push bei jedem Lauf
+                log("Alle Wunschtermine vorbei, nichts mehr zu tun.")
+                break
             notify("Sagrada-Wächter beendet", "Alle Wunschtermine liegen in der Vergangenheit.", priority=2)
             break
         try:
@@ -251,7 +289,10 @@ def main():
                 log("Hinweis: " + n)
             new = sorted(free - last_free)
             if new:
-                lines = "\n".join(datetime.strptime(s, "%Y-%m-%d %H:%M").strftime("%a %d.%m. %H:%M") for s in new)
+                def fmt(slot):
+                    dt = datetime.strptime(slot, "%Y-%m-%d %H:%M")
+                    return dt.strftime("%a %d.%m. %H:%M") + (" (Test-Termin)" if dt.date() in TEST_DATES else "")
+                lines = "\n".join(fmt(x) for x in new)
                 log("NEU FREI:\n" + lines)
                 notify("🎟️ Sagrada Familia: Slot frei!",
                        f"{lines}\n\nSchnell buchen (2 Tickets), tippen öffnet die Seite.", priority=5,
@@ -261,6 +302,8 @@ def main():
         except Exception as e:
             errors += 1
             log(f"Fehler ({errors}): {e}")
+            if args.once:
+                sys.exit(1)          # GitHub markiert den Lauf dann als fehlgeschlagen und schickt eine Mail
             if errors == 3:
                 notify("Sagrada-Wächter hat Probleme", f"3 Fehler in Folge: {e}", priority=3, tags=("warning",))
 
