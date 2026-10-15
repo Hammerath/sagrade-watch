@@ -38,6 +38,16 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         run: python sagrada_watch.py --once
 
+      # Screenshots und Mitschnitt zum Nachsehen (unter dem Lauf bei "Artifacts")
+      - name: Diagnose-Dateien sichern
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnose
+          path: debug/
+          retention-days: 3
+          if-no-files-found: ignore
+
       - name: Zustand speichern
         if: always()
         uses: actions/cache/save@v4
