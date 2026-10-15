@@ -48,10 +48,7 @@ for d in range(19, 24):
 for d in range(24, 31):
     TARGETS[date(YEAR, 10, d)] = None
 
-# TEST: hier sind noch Slots frei, damit lässt sich prüfen, ob der Bot funktioniert.
-# Nach erfolgreichem Test diese beiden Zeilen löschen.
-TEST_DATES = {date(YEAR, 11, 9)}
-TARGETS.update({d: None for d in TEST_DATES})
+TEST_DATES = set()   # Testtermine (werden in der Nachricht als "Test-Termin" markiert)
 
 BASE = Path(__file__).resolve().parent
 STATE_FILE = BASE / "sagrada_state.json"
