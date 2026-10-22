@@ -22,7 +22,8 @@ import random
 import re
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
@@ -39,16 +40,24 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")                    # vom @
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or "8965207955"     # Mikeys Chat-ID
 
 INTERVAL_MIN = 5          # Minuten zwischen zwei Prüfungen
+MIN_TICKETS = 2           # nur melden, wenn mindestens so viele Tickets zur gleichen Uhrzeit frei sind
+CONFIRM_SECONDS = 20      # nach einem Alarm so viele Sekunden später nachprüfen und Status nachschicken (0 = aus)
 YEAR = 2026
 
 # Datum -> frühester akzeptabler Startzeitpunkt ("HH:MM"), None = ganztags
-TARGETS = {date(YEAR, 10, 18): None}
-for d in range(19, 24):
-    TARGETS[date(YEAR, 10, d)] = "15:00"      # hier ggf. "16:00" oder früher eintragen
-for d in range(24, 31):
-    TARGETS[date(YEAR, 10, d)] = None
+# Aktuell: 22.10. bis 31.10. ganztags. Vergangene Tage überspringt der Bot automatisch.
+# Einzelne Tage mit Uhrzeit-Grenze z.B. so: TARGETS[date(YEAR, 10, 27)] = "15:00"
+TARGETS = {date(YEAR, 10, d): None for d in range(22, 32)}
 
 TEST_DATES = set()   # Testtermine (werden in der Nachricht als "Test-Termin" markiert)
+
+TZ = ZoneInfo("Europe/Madrid")     # GitHub-Server laufen auf UTC, maßgeblich ist die Zeit in Barcelona
+MIN_LEAD_MIN = 30                  # heute nur Slots melden, die mindestens so viele Minuten in der Zukunft liegen
+
+
+def now_bcn():
+    return datetime.now(TZ)
+
 
 BASE = Path(__file__).resolve().parent
 STATE_FILE = BASE / "sagrada_state.json"
@@ -137,21 +146,33 @@ JS_SLOTS = r"""
 ([timeRe, soldRe]) => {
   const tr = new RegExp(timeRe), sr = new RegExp(soldRe, 'i');
   const cls = e => { const c = e.className; return (c && c.baseVal !== undefined) ? c.baseVal : (c || ''); };
+  const clean = x => (x || '').replace(/\s+/g, ' ').trim();
+  // Restplätze aus dem Text neben der Uhrzeit lesen ("2 tickets left", "quedan 1", "last ticket" ...)
+  const leftOf = txt => {
+    const t = txt.replace(/\d{1,2}[:.]\d{2}/g, ' ');
+    if (/last\s+ticket|[uú]ltim[ao]\s+entrada|darrera\s+entrada|letztes\s+ticket/i.test(t)) return 1;
+    let m = t.match(/(\d+)\s*(?:tickets?|places?|seats?|spots?|entradas?|entrades?|plazas?|places?|llocs?|pl\.)?\s*(?:left|remaining|available|disponibles?|restantes?|lliures?|übrig|frei)/i)
+         || t.match(/(?:only|solo|sólo|nom[eé]s|nur|quedan?|queden?|resten?|left:?|remaining:?|disponibles?:?)\s*(\d+)/i);
+    return m ? parseInt(m[1], 10) : null;
+  };
   const out = {};
   for (const el of document.querySelectorAll('button, label, li, a, div, span, [role=button], [role=radio], [role=option]')) {
     if (el.offsetParent === null || !el.innerText || el.innerText.length > 40) continue;
     const m = el.innerText.match(tr);
     if (!m || el.querySelector('button, label, li')) continue;
     const t = m[1].padStart(2, '0') + ':' + m[2];
-    let bad = false;
+    let bad = false, ctx = clean(el.innerText);
     for (let e = el, i = 0; e && i < 3; e = e.parentElement, i++) {
+      const txt = clean(e.innerText);
+      if (txt.length <= 120 && (txt.match(/\d{1,2}[:.]\d{2}/g) || []).length <= 1) ctx = txt;   // Text rund um genau diesen Slot
       if (e.disabled || e.getAttribute('aria-disabled') === 'true' ||
           /disabled|unavailable|not-available|sold|full|complet|blocked|inactive/i.test(cls(e)) ||
           sr.test(e.innerText || '')) { bad = true; break; }
     }
     const st = getComputedStyle(el);
     if (st.pointerEvents === 'none' || parseFloat(st.opacity) < 0.5) bad = true;
-    out[t] = (out[t] === true) || !bad;
+    const prev = out[t];
+    if (!prev || (!prev.avail && !bad)) out[t] = {avail: !bad, left: leftOf(ctx), ctx: ctx};
   }
   return out;
 }
@@ -212,9 +233,13 @@ def diagnose(page, label):
         log(f"Diagnose nicht möglich: {e}")
 
 
-def check_once(debug=False):
-    """Gibt (Menge freier passender Slots, Liste von Hinweisen) zurück."""
-    today = date.today()
+def check_once(debug=False, only_dates=None, on_found=None):
+    """Gibt (Menge freier passender Slots, Liste von Hinweisen) zurück.
+    only_dates: optional nur diese Tage prüfen (für die Gegenprobe).
+    on_found: optional Funktion, die sofort mit (Tag, [Uhrzeiten]) aufgerufen wird, sobald etwas frei ist."""
+    now = now_bcn()
+    today = now.date()
+    soon = (now + timedelta(minutes=MIN_LEAD_MIN)).strftime("%H:%M")
     free, notes = set(), []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not debug)
@@ -243,7 +268,7 @@ def check_once(debug=False):
         found_any = False
         try:
             for d, earliest in sorted(TARGETS.items()):
-                if d < today:
+                if d < today or (only_dates is not None and d not in only_dates):
                     continue
                 if d.month != current_month:              # neuer Monat: Seite frisch laden und hinblättern
                     current_month = d.month
@@ -269,8 +294,21 @@ def check_once(debug=False):
                 if capture:
                     page.screenshot(path=str(DEBUG_DIR / f"{d:%m%d}.png"), full_page=True)
 
-                ok = sorted(t for t, avail in slots.items() if avail and (earliest is None or t >= earliest))
+                ok = []
+                for t, sl in sorted(slots.items()):
+                    if not sl["avail"] or (earliest is not None and t < earliest):
+                        continue
+                    if d == today and t < soon:            # heute schon vorbei oder nicht mehr erreichbar
+                        continue
+                    if sl["left"] is not None and sl["left"] < MIN_TICKETS:
+                        log(f"{d:%d.%m.} {t}: nur {sl['left']} Ticket(s) übrig, wird ignoriert | Text: {sl['ctx']!r}")
+                        continue
+                    log(f"{d:%d.%m.} {t}: frei, Restplätze: {sl['left'] if sl['left'] is not None else 'unbekannt'} "
+                        f"| Text: {sl['ctx']!r}")
+                    ok.append(t)
                 log(f"{d:%d.%m.}: {len(slots)} Slots erkannt, passend frei: {', '.join(ok) or '-'}")
+                if ok and on_found:
+                    on_found(d, ok)                    # sofort melden, nicht erst nach allen Tagen
                 if not slots:
                     notes.append(f"{d:%d.%m.}: Tag anklickbar, aber keine Uhrzeiten erkannt")
                 for t in ok:
@@ -306,27 +344,56 @@ def main():
                f"Beobachte {len(TARGETS)} Tage, Prüfung alle {INTERVAL_MIN} Min.", priority=2, tags=("robot",))
 
     while True:
-        if date.today() > max(TARGETS):
+        if now_bcn().date() > max(TARGETS):
             if args.once:                     # auf GitHub: still beenden, kein Push bei jedem Lauf
                 log("Alle Wunschtermine vorbei, nichts mehr zu tun.")
                 break
             notify("Sagrada-Wächter beendet", "Alle Wunschtermine liegen in der Vergangenheit.", priority=2)
             break
         try:
-            free, notes = check_once(debug=args.debug)
-            errors = 0
-            for n in notes:
-                log("Hinweis: " + n)
-            new = sorted(free - last_free)
-            if new:
-                def fmt(slot):
-                    dt = datetime.strptime(slot, "%Y-%m-%d %H:%M")
-                    return dt.strftime("%a %d.%m. %H:%M") + (" (Test-Termin)" if dt.date() in TEST_DATES else "")
+            def fmt(slot):
+                dt = datetime.strptime(slot, "%Y-%m-%d %H:%M")
+                return dt.strftime("%a %d.%m. %H:%M") + (" (Test-Termin)" if dt.date() in TEST_DATES else "")
+
+            alerted = []
+
+            def alarm(d, times):
+                """Neue Slots sofort melden, noch während die übrigen Tage geprüft werden."""
+                new = [f"{d.isoformat()} {t}" for t in times if f"{d.isoformat()} {t}" not in last_free]
+                if not new:
+                    return
+                alerted.extend(new)
                 lines = "\n".join(fmt(x) for x in new)
                 log("NEU FREI:\n" + lines)
                 notify("🎟️ Sagrada Familia: Slot frei!",
-                       f"{lines}\n\nSchnell buchen (2 Tickets), tippen öffnet die Seite.", priority=5,
+                       f"{lines}\n\nSchnell buchen ({MIN_TICKETS} Tickets), tippen öffnet die Seite.", priority=5,
                        tags=("tada", "church"))
+
+            free, notes = check_once(debug=args.debug, on_found=alarm)
+            errors = 0
+            for n in notes:
+                log("Hinweis: " + n)
+
+            if alerted and CONFIRM_SECONDS:
+                # Nachkontrolle: Der Alarm ist schon raus. Jetzt prüfen, ob die Slots noch da sind,
+                # und das als leise Folgenachricht schicken. So weißt du, ob sich das Weiterklicken lohnt.
+                time.sleep(CONFIRM_SECONDS)
+                dates = {datetime.strptime(x, "%Y-%m-%d %H:%M").date() for x in alerted}
+                try:
+                    again, _ = check_once(debug=args.debug, only_dates=dates)
+                    still = [x for x in alerted if x in again]
+                    gone = [x for x in alerted if x not in again]
+                    msg = []
+                    if still:
+                        msg.append("✅ Noch frei:\n" + "\n".join(fmt(x) for x in still))
+                    if gone:
+                        msg.append("❌ Schon wieder weg:\n" + "\n".join(fmt(x) for x in gone))
+                    log("Nachkontrolle: " + " | ".join(m.replace("\n", " ") for m in msg))
+                    notify(f"Nachkontrolle nach {CONFIRM_SECONDS} s", "\n\n".join(msg), priority=2)
+                    free -= set(gone)      # verschwundene Slots beim nächsten Auftauchen wieder melden
+                except Exception as e:
+                    log(f"Nachkontrolle fehlgeschlagen: {e}")
+
             last_free = free
             save_state(free)
         except Exception as e:
