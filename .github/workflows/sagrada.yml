@@ -1,54 +1,15 @@
-Claude
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Sagrada · YML
 name: Sagrada Ticket-Wächter
- 
+
 on:
   schedule:
     - cron: "*/10 * * * *"     # Reserve, falls cron-job.org mal ausfällt
   workflow_dispatch:            # wird von cron-job.org alle 5 Minuten ausgelöst
- 
+
 # Immer nur ein Lauf gleichzeitig. Ein weiterer wartet und startet sofort, wenn der vorige endet.
 concurrency:
   group: sagrada
   cancel-in-progress: false
- 
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -59,12 +20,12 @@ jobs:
       options: --ipc=host
     steps:
       - uses: actions/checkout@v4
- 
+
       - name: Abhängigkeiten
         run: |
           python3 -m pip install --break-system-packages -q playwright==1.58.0 requests \
             || python3 -m pip install -q playwright==1.58.0 requests
- 
+
       # Merkt sich, welche Slots schon gemeldet wurden, damit keine Doppel-Pushes kommen
       - name: Zustand laden
         uses: actions/cache/restore@v4
@@ -72,14 +33,14 @@ jobs:
           path: sagrada_state.json
           key: sagrada-state-${{ github.run_id }}
           restore-keys: sagrada-state-
- 
+
       - name: Tickets prüfen
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           PYTHONUNBUFFERED: "1"
         # 9 Minuten lang immer wieder prüfen, danach übernimmt der nächste Lauf
         run: python3 sagrada_watch.py --once --minutes 9
- 
+
       - name: Diagnose-Dateien sichern
         if: always()
         uses: actions/upload-artifact@v4
@@ -88,12 +49,10 @@ jobs:
           path: debug/
           retention-days: 3
           if-no-files-found: ignore
- 
+
       - name: Zustand speichern
         if: always()
         uses: actions/cache/save@v4
         with:
           path: sagrada_state.json
           key: sagrada-state-${{ github.run_id }}
- 
-Claude hat die Antwort abgeschlossen
